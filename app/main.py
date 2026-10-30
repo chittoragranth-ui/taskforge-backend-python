@@ -1,15 +1,20 @@
-
-import uuid
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, status , Query
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    status,
+    Query,
+    Depends,
+)
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+from .database import get_db
+from .models import Job
 
 
 app = FastAPI(title="TaskForge API")
-
-# Temporary in-memory storage for jobs
-jobs: dict[str, dict[str, Any]] = {}
 
 
 # Request model for creating a job
@@ -23,6 +28,16 @@ class JobStatusUpdate(BaseModel):
     status: str = Field(
         pattern="^(queued|processing|completed|failed)$"
     )
+
+
+# Convert database object into a dictionary
+def serialize_job(job: Job) -> dict[str, Any]:
+    return {
+        "id": job.id,
+        "type": job.type,
+        "payload": job.payload,
+        "status": job.status,
+    }
 
 
 # Home endpoint
@@ -48,49 +63,59 @@ def health_check():
     "/api/v1/jobs",
     status_code=status.HTTP_202_ACCEPTED,
 )
-def create_job(job: JobCreate):
-    job_id = str(uuid.uuid4())
+def create_job(
+    job: JobCreate,
+    db: Session = Depends(get_db),
+):
+    db_job = Job(
+        type=job.type,
+        payload=job.payload,
+        status="queued",
+    )
 
-    job_data = {
-        "id": job_id,
-        "type": job.type,
-        "payload": job.payload,
-        "status": "queued",
-    }
-
-    jobs[job_id] = job_data
+    db.add(db_job)
+    db.commit()
+    db.refresh(db_job)
 
     return {
         "message": "Job created successfully",
-        "job": job_data,
+        "job": serialize_job(db_job),
     }
 
 
 # List all jobs
-
-
 @app.get("/api/v1/jobs")
 def list_jobs(
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=10, ge=1, le=100),
+    db: Session = Depends(get_db),
 ):
-    all_jobs = list(jobs.values())
-    paginated_jobs = all_jobs[skip : skip + limit]
+    query = db.query(Job)
+
+    total_count = query.count()
+
+    jobs = (
+        query.order_by(Job.id)
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
 
     return {
-        "count": len(all_jobs),
+        "count": total_count,
         "skip": skip,
         "limit": limit,
-        "jobs": paginated_jobs,
+        "jobs": [serialize_job(job) for job in jobs],
     }
-
-
 
 
 # Retrieve a job by its ID
 @app.get("/api/v1/jobs/{job_id}")
-def get_job(job_id: str):
-    job = jobs.get(job_id)
+def get_job(
+    job_id: str,
+    db: Session = Depends(get_db),
+):
+    job = db.query(Job).filter(Job.id == job_id).first()
 
     if job is None:
         raise HTTPException(
@@ -98,7 +123,7 @@ def get_job(job_id: str):
             detail="Job not found",
         )
 
-    return {"job": job}
+    return {"job": serialize_job(job)}
 
 
 # Update a job's status
@@ -106,8 +131,9 @@ def get_job(job_id: str):
 def update_job_status(
     job_id: str,
     update: JobStatusUpdate,
+    db: Session = Depends(get_db),
 ):
-    job = jobs.get(job_id)
+    job = db.query(Job).filter(Job.id == job_id).first()
 
     if job is None:
         raise HTTPException(
@@ -115,9 +141,12 @@ def update_job_status(
             detail="Job not found",
         )
 
-    job["status"] = update.status
+    job.status = update.status
+
+    db.commit()
+    db.refresh(job)
 
     return {
         "message": "Job status updated successfully",
-        "job": job,
+        "job": serialize_job(job),
     }
